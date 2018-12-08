@@ -1,0 +1,263 @@
+---
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(gridExtra)
+library(cowplot)
+
+accounts <-  read_tsv("hadley_similar.txt")
+```
+
+# Twitter Lookalike Analysis
+## Finding Hadley Wickham's Twitter-Doppelgangers
+
+###TL;DR:
+
+Using Python's `tweepy` package, I pulled data about Hadley Wickham's followers and who they were following to find twitter accounts that were similar to Hadley Wickham. Using Jaccard similarity to create a score based on how many followers other Twitter accounts had in common with Hadley, I was able to sort a list of accounts successfully, with very similar accounts ranking highest and dissimilar accounts ranking lowest. I also performed a text analysis on the accounts' descriptions to confirm this stratification at a broader level.
+
+### Lookalike what? Hadley who?
+
+This semester has been a crazy combination of school, work, and farmlife, with my farm taking a sad third seat to the other two most of the time (sorry alpacas, and thank you husband). In school I've been cramming my brain full of various data manipulation and collection techniques, statistical and mathematical algorithms, and data visualization and communication guidelines. At work, I somehow seem to use exactly what I'm learning as soon as I learn it.
+
+The idea for this project came at one of those intersections of school and work. At work, we were trying to figure out how to identify a certain elusive type of potential client, and in school I was learning about interfacing with the Twitter API and calculating various mathematical similarities. So I had the idea that a person could use the Twitter API to create a list of potentially similar accounts and then rank these based on the number of followers that they have in common with a starting account. Because it has a similar flavor to Facebook's [lookalike audience](https://www.facebook.com/business/a/lookalike-audiences), I started calling this a lookalike analysis.
+
+My use of Twitter revolves almost entirely around data science and statistics, so when I was looking for an account to use as a proof-of-concept for this technique, my selection was a bit skewed. And I have to admit, my inner fan-girl got a little giddy when I ran across Hadley Wickham's account as a candidate. Hadley Wickham is the Chief Scientist at RStudio, and he co-wrote the book, *R for Data Science*, that was my first real introduction into the field that I have come to love. Plus he's super smart, makes really cool R packages, and seems generally awesome overall. I decided to go for it, and so the search for Hadley Wickham's Twitter lookalikes began.
+
+*For another class, I needed to create an interesting visualization of an analysis that I'd done, so I tried my hand at creating an infographic using [piktochart.com](https://piktochart.com/). You'll see bits of this scattered throughout this post*
+<center>
+![Hadley's Twitter Stats](C://Users/Anna/Documents/MSBA/Applied Data Analytics/HadleyTwitter/000_smallest.png)
+</center>
+
+###Twitter: I can haz data?
+
+The first step to performing this analysis was to figure out how to get the data I needed from Twitter. I decided to use python's `tweepy` package since it seemed to have the most straightforward interaction with Twitter's API. I created a script of functions which can be found on [github](https://github.com/amarbut/TweepyFunctions) to handle most of the messiness of talking to the API. Not all of these functions were built specifically for this project.
+
+To start the data collection, I needed to first connect to the Twitter API and then to get some information about Hadley's twitter account, namely his unique account id (although you can theoretically use a Twitter handle in place of the account id, I found that it saved some headache to stick with the id).
+
+```
+import TwitterFunctions as tf
+
+auth_api = tf.twitter_connect(consumer_key, consumer_secret, access_token, access_token_secret)
+
+hadley = tf.get_user_object("@hadleywickham", auth_api)
+hadleyid = hadley[0]
+```
+
+<center>
+![Twitter Lookalike](C:/Users/Anna/Documents/MSBA/Applied Data Analytics/HadleyTwitter/001_small.png)
+</center>
+\n
+
+At this point, I've found that it's useful to have a diagram to help explain the concept of the "Twitter Lookalike" analysis. The idea is that we can identify accounts that are similar to the "starting account" by looking at the accounts that its followers are following. So I first needed to pull the account ids for all of Hadley's followers.
+
+```
+level1 = tf.get_follower_ids(hadleyid, auth_api) #returns 74,820 followers
+```
+
+Twitter has various rate limits for its API, presumably to keep bots from overrunning the whole platform. This is fine, but with a list of almost 75K followers, I realized that it would take about a month to pull all of the "friends" (accounts that a user is following) of Hadley's followers. I decided to filter these followers down to accounts that were following between 25 and 100 other accounts, the theory being that these accounts were active enough to follow more than just a few accounts, but selective enough that the accounts they follow indicate a specific interest. This still left me with 13K followers, so within this list I took a random sample of 5000 accounts (leaving me with only ~3 days of "friend"-pulling).
+
+```
+import random
+
+#split followers into chunks of 100 to assuage Twitter's rate limits
+requests = [level1[i:i+100] for i in range(0, len(level1), 100)]
+
+#filter out followers who follow >100 or <25 accounts
+followers = []
+for request in requests:
+    users = tf.get_users(request, auth_api)
+    for user in users:
+        if user[3] <= 100 and user[3] >=25:
+            followers.append(user[0]) # returns 13,416 followers
+
+#randomly select 5000 followers to explore network
+rand_followers = random.sample(followers, 5000)
+```
+
+The next task was to pull the account ids for these followers' "friends" and tally up how many of Hadley's followers were following them. It's worth noting at this point that some Twitter users have their accounts protected so that you can't pull things like their "friends" list, thus the simple exception handler seen below.
+
+```
+from collections import defaultdict
+
+level2 = defaultdict(int)
+for follower in rand_followers:
+    try:
+        for friend in tf.get_friend_ids(follower, auth_api):
+            level2[friend] += 1
+    except:
+        print("Error. Skipping", follower)
+```
+
+This resulted in a list of about 120K accounts that had any followers in common with Hadley Wickham. After filtering for accounts that had more than 5 common followers, I was left with about 6K. Now I needed to calculate a similarity score for each of these accounts based on the number of followers they have in common with Hadley Wickham. This may be obvious, but I couldn't simply use the raw count since this would bias the results towards accounts that have tons of followers (accounts like @CNN or @katyperry). I decided to use Jaccard similarity.
+
+$$JaccardSimilarity = \frac{a \cap b}{a \cup b}= \frac{followers_{ab}}{followers_a + followers_b - followers_{ab}}$$
+There may be some mathematical issue with using this similarity measure on data collected from a sample, but it didn't make a difference in the rank order to use the number of followers in the sample vs the total number of Hadley's followers, so I went with the sample number. Please let me know if there is an issue with this, as I'd be interested to learn what it is.
+
+```
+#for all level2 followers with more than 5 common followers
+accounts = [account for account in level2 if level2[account]>=5]
+
+#separate into batches of 100 for twitter API
+account_batches = [accounts[i:i+100] for i in range(0, len(accounts), 100)]
+
+#collect account info, calculate jaccard similarity
+account_info = defaultdict(list)
+for batch in account_batches:
+    users = tf.get_users(batch, auth_api)
+    for user in users:
+        twitterid = user[0]
+        common_followers = level2[twitterid]
+        #4607 is the number of followers not protected on Twitter
+        similarity_score = common_followers/(4607+user[2]-common_followers)
+        info = [user[1:],[common_followers, similarity_score]]
+        account_info[twitterid] = info
+```
+
+Now I had my data and I could finally move back into R for analysis and visualization. It did feel a little wrong to be doing an analysis about Hadley Wickham in python, so I was glad to do at least some R work for this project.
+
+###So...did it work?
+
+I first wanted to get a look at the distribution of similarity scores to get a broader feel for the results. As can be seen below, the scores were extremely skewed, with the vast majority of those ~6K accounts scoring very close to zero.
+
+<center>
+```{r, echo=FALSE}
+accounts%>%
+  filter(handle != "hadleywickham")%>%
+  ggplot(aes(x = similarity_score))+
+  geom_density()+
+  theme_bw()+
+  labs(title = "Distribution of Similarity Scores among Lookalike Accounts",
+       x = "Similarity Score", y = "Density of Accounts")
+```
+</center>
+
+When I filtered for accounts that had a similarity score of greater than 0.01, I was left with only 49 accounts.
+
+<center>
+```{r, echo = FALSE}
+accounts%>%
+  filter(handle != "hadleywickham", similarity_score >= 0.01)%>%
+  ggplot(aes(x = similarity_score))+
+  geom_density()+
+  theme_bw()+
+  labs(title = "Distribution of Similarity Scores among Top Lookalike Accounts",
+       x = "Similarity Score", y = "Density of Accounts")
+```
+</center>
+
+Looking at the three highest scoring accounts was pretty exciting. All three mention either #rstats or Rstudio in their descriptions, two are engineers at Rstudio (Garret Grolemund is actually the other author of *R for Data Science*), and the third is a Twitter account all about using RStudio. Based on these results, I'd definitely say that the analysis was successful.
+
+<center>
+![top lookalikes](C:/Users/Anna/Documents/MSBA/Applied Data Analytics/HadleyTwitter/003_small.png)
+</center>
+
+And how about the lowest ranking accounts? Unsurprisingly, all 50 of the lowest ranking accounts had over 10 million followers and were completely unrelated to Hadley Wickham's Twitter personality. The high number of followers both explains why they would show up on the list of lookalikes (since having at least 5 followers in common with another account when you have 10+ million followers is highly probable), and why they would be ranked at the bottom of the list (because of the way that a Jaccard similarity is constructed). The lowest three accounts are shown below.
+
+<center>
+![bottom lookalikes](C:/Users/Anna/Documents/MSBA/Applied Data Analytics/HadleyTwitter/004_small.png)
+</center>
+
+###And some text analysis!
+
+While skimming through the highest and lowest ranking accounts gave me a pretty good idea of whether or not the analysis worked (it did!), I wanted to find a more objective way to decide. So I did a very basic text analysis of the account descriptions, looking at which words were used most frequently.
+
+I started by looking at all of the accounts that made it onto the Lookalike list (those with > 5 followers in common with Hadley Wickham). Here we see that the top word by far was "data", followed by "science", which is pretty awesome since Hadley Wickham is a data scientist. The rest of the words are a mix of Hadley-related words (research, professor, etc.) and more generically Twitter-related words (official, account, twitter, etc.).
+
+*Disclaimer: I made word-clouds because I recognize that they look nice and are an interesting way to display word frequency, but the Linguist in me does not approve. So I made bar-charts displaying the top 10 words and their frequencies as well.*
+
+<center>
+```{r, echo = FALSE, message = FALSE, fig.width = 3, fig.height = 3}
+all_tidytext <- accounts%>%
+  select(twitterid, desc)%>%
+  unnest_tokens(word, desc)%>%
+  anti_join(stop_words)%>%
+  filter(word != "https", word != "t.co")%>%
+  count(word, sort= TRUE)
+
+ all_tidytext%>%
+  with(wordcloud(word, n, max.words = 50, scale=c(3.5,0.25)))
+```
+```{r, echo=FALSE, message = FALSE, fig.width = 5, fig.height = 3}
+ all_tidytext%>%
+  mutate(word = reorder(word, n))%>%
+  head(10)%>%
+  ggplot(aes(word, n)) +
+  geom_col(show.legend = FALSE, fill = "cornflowerblue") +
+  labs(x = NULL, y = "Term Frequency", title = "Top Words in All Lookalike Accounts") +
+  coord_flip()
+```
+</center>
+
+When I filter down to the highest scoring accounts, the top words become much more exclusively Hadley-related. In this group, rstats, data, and science were used most frequently in account descriptions.
+<center>
+```{r, echo = FALSE, message = FALSE, warning = FALSE, fig.width = 3, fig.height = 3}
+top_accounts <- accounts%>%
+  filter(handle != "hadleywickham", similarity_score >= 0.01)
+top_tidytext <- top_accounts%>%
+  select(twitterid, desc)%>%
+  unnest_tokens(word, desc)%>%
+  anti_join(stop_words)%>%
+  filter(word != "https", word != "t.co")%>%
+  count(word, sort = TRUE)
+top_tidytext%>%
+  with(wordcloud(word, n, max.words = 50, scale = c(3.5, 0.25)))
+```
+```{r, echo=FALSE, message = FALSE, fig.width = 5, fig.height = 3}
+top_tidytext%>%
+  mutate(word = reorder(word, n))%>%
+  head(10)%>%
+  ggplot(aes(word, n)) +
+  geom_col(show.legend = FALSE, fill = "darkseagreen") +
+  labs(x = NULL, y = "Term Frequency", title = "Top Words in Most Similar Accounts") +
+  coord_flip()
+```
+</center>
+
+And finally looking at the bottom ranking accounts, we see once again that they are not related to Hadley Wickham's interests at all. It's also interesting to note that the overall frequency of these terms is *much* lower than in the other two groups, suggesting that these accounts are not particularly similar to each other either.
+
+<center>
+```{r, echo = FALSE, message = FALSE, fig.width = 3, fig.height = 3}
+bottom_accounts <- accounts%>%
+  filter(handle != "hadleywickham")%>%
+  arrange(similarity_score)%>%
+  head(50)
+
+bottom_tidytext <- bottom_accounts%>%
+  select(twitterid, desc)%>%
+  unnest_tokens(word, desc)%>%
+  anti_join(stop_words)%>%
+  filter(word != "https", word != "t.co", word != "del", nchar(word) >=4, word != "it's")%>%
+  count(word, sort = TRUE)
+
+bottom_tidytext%>%
+  with(wordcloud(word, n, max.words = 50, scale = c(1.5, 0.25), min.freq = 1))
+```
+```{r, echo=FALSE, message = FALSE, fig.width = 5, fig.height = 3}
+bottom_tidytext%>%
+  mutate(word = reorder(word, n))%>%
+  head(10)%>%
+  ggplot(aes(word, n)) +
+  geom_col(show.legend = FALSE, fill = "brown") +
+  labs(x = NULL, y = "Term Frequency", title = "Top Words in Least Similar Accounts") +
+  coord_flip()
+```
+</center>
+
+### What's next?
+
+Overall, this was a very exciting and successful proof-of-concept for my Twitter Lookalike idea. The biggest issue I ran into is that Twitter's rate limit made it nearly impossible to get the data for all of the starting account's followers. While it wasn't an issue in the context of this project, if I'm trying to get a somewhat exhaustive list of similar accounts for marketing at work, I'd want to figure out how to get everything. 
+
+Another issue that would arise in the context of work is that a lot of the top ranking accounts were within the same company as the starting account. This wouldn't be helpful since we don't want to market to people working for a company that already has a contract with us. I did experiment a little with filtering accounts based on whether or not their descriptions included a list of company-specific words, and that seemed to mostly deal with this issue.
+
+I also played with collecting the 50 most recent tweets from the starting account and all of the lookalike accounts, and then performing cosine similarity on these as an alternative similarity score. However, the word limit and content of tweets don't lend themselves to cosine similarity very well, and I found basically no difference in these scores between accounts that had very high Jaccard similarities and those that had very low Jaccard similarities.
+
+One other idea that I had was to do a very similar analysis, but instead of creating the first list of account ids by collecting followers of a specific account, I would start with a list of accounts that tweeted a specific hashtag. Pulling the "friends" of these tweeters would theoretically give me a list of Twitter accounts that are related to that hashtag. In this scenario, the similarity score would be calculated with the total number of tweeters replacing the total number of followers (or the sample number) from the starting account.
